@@ -207,7 +207,7 @@ def main_loop(device, audio_input_buffer, audio_output_buffer,  start_recording,
                 if sample_rate != TARGET_SAMPLE_RATE:
                     t = librosa.core.resample(t, orig_sr=sample_rate, target_sr=TARGET_SAMPLE_RATE)
                     t = t.transpose()
-                t = torch.from_numpy(t)
+                t = torch.from_numpy(t.copy())
                 t = torch.unsqueeze(t,0)
                 # preprocess audio data
                 length = torch.tensor([t.shape[1]], dtype=torch.float32)

@@ -3,6 +3,7 @@ import os
 subdirectory_path = os.path.join(os.path.dirname(__file__), 'StyleTTS2')
 sys.path.append(subdirectory_path)
 
+import numpy as np
 import wget
 import yaml
 import torch
@@ -116,8 +117,11 @@ class StyleTTS2Model(torch.nn.Module):
         text = text.strip()
         text = text.replace('"', '')
         ps = self.global_phonemizer.phonemize([text])
-        ps = word_tokenize(ps[0])
-        ps = ' '.join(ps)
+        if (len(ps) > 0) :
+            ps = word_tokenize(ps[0])
+            ps = ' '.join(ps)
+        else:
+            return np.empty(shape=(0))
 
         tokens = self.textclenaer(ps)
         tokens.insert(0, 0)

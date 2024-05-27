@@ -265,11 +265,11 @@ class LLM(torch.nn.Module):
         self.device = device
 
         # Initialize given model. Weights are downloaded from HF hub and cached
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=True).to(self.device)
-        self.model.eval()
+        self.model = AutoModelForCausalLM.from_pretrained(model_name,low_cpu_mem_usage=True, torch_dtype="auto", trust_remote_code=True).to(self.device)
+        # self.model.eval()
 
         # Initialize tokenizer for given model. Weights are downloaded from HF hub and cached
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
         # Specify special tokens for inference
         self.pad_token_id =  self.model.generation_config.eos_token_id
@@ -293,7 +293,7 @@ class LLM(torch.nn.Module):
         Returns:
             string containing the resolved text
         """ 
-        return self.tokenizer.batch_decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return self.tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
     def forward(self, input_token, past_key_values, cur_len):
         """Perform a single LLM inference step  
@@ -306,21 +306,20 @@ class LLM(torch.nn.Module):
         """ 
         unfinished_sequences = torch.ones([1], dtype=torch.long, device=self.device)
         # prepare model inputs and set key-value chache
-        model_inputs = self.model.prepare_inputs_for_generation(input_token, past_key_values=past_key_values, use_cache=True)
+        model_inputs = self.model.prepare_inputs_for_generation(input_token, past_key_values=past_key_values, use_cache=True, return_dict=True)
         
         # forward pass to get logits and updated key value cache
-        outputs =self.model(**model_inputs, return_dict=True)
-        past_key_values = outputs.past_key_values
-        next_token_logits = outputs.logits[:, -1, :]
-
+        next_token_logits, past_key_values = self.model(**model_inputs).to_tuple()
+  
         # Prevent prediction of EOS token if min lenght of sequence is not reached
         if cur_len < self.MIN_LENGTH: 
             for i in self.eos_token_id:
-                next_token_logits[:, i] = -float("inf")
+                next_token_logits[:, :, i] = -float("inf")
         
         # Select token with highes probability
-        next_tokens = torch.argmax(next_token_logits, dim=-1)
-        next_tokens = next_tokens * unfinished_sequences + self.pad_token_id * (1 - unfinished_sequences)
+        # next_tokens = torch.argmax(next_token_logits, dim=-1)
+        # next_tokens = next_tokens * unfinished_sequences + torch.Tensor(self.pad_token_id * (1 - unfinished_sequences)).to(self.device)
+        next_tokens = next_token_logits.argmax(dim=-1)
         return next_tokens, past_key_values
 
 class TTS(torch.nn.Module):
@@ -372,7 +371,7 @@ class STT_LLM_TTS(torch.nn.Module):
         self.stt = STT(vocabulary_path="vocab.npy")
         
         # Init LLM model 
-        self.llm = LLM(model_name="microsoft/phi-2", device=device)
+        self.llm = LLM(model_name="microsoft/Phi-3-mini-4k-instruct", device=device)
 
         # Init TTS model
         self.tts = TTS(device=device, tts_model=tts_model)
@@ -494,7 +493,7 @@ class STT_LLM_TTS(torch.nn.Module):
             print("\n\n ## Listening... ")
 
             # Add format token
-            self.call_LLM(input="\nHuman:", reason="format", tokenize=True)
+            self.call_LLM(input="\n<|user|>\n", reason="format", tokenize=True)
 
         if (len(transcribed_text) == 0 or transcribed_text.startswith(" ")) and len(self.current_word)>0:
             # --> new word
@@ -502,7 +501,7 @@ class STT_LLM_TTS(torch.nn.Module):
             self.transcribed_words.append(new_word)
             self.current_word = transcribed_text
             self.counter = 0
-
+            
             # call LLM to process new input token
             self.call_LLM(input=new_word, reason="input", tokenize=True)
         
@@ -540,8 +539,8 @@ class STT_LLM_TTS(torch.nn.Module):
             wav: Synthesized speech from the TTS or None if end is False
         """ 
         # Check if eos token or a fullstop was predicted
-        end_of_sentence = self.last_token.eq(self.llm.sentence_stop_token_id_tensor)
-        end_of_sequence = self.last_token.eq(self.llm.eos_token_id_tensor)
+        end_of_sentence = torch.any(self.last_token.eq(self.llm.sentence_stop_token_id_tensor))
+        end_of_sequence = torch.any(self.last_token.eq(self.llm.eos_token_id_tensor))
         end = False
         wav = None
         response = None
@@ -551,7 +550,6 @@ class STT_LLM_TTS(torch.nn.Module):
             if time.time() - self.last_token_timestep > 0.3:
                 end = True
                 response = self.llm.detokenize(self.response_sentence)
-                response = "".join(response)
 
                 # synthesize generated sequence
                 t_start_tts = time.time()
@@ -588,7 +586,6 @@ class STT_LLM_TTS(torch.nn.Module):
                 
                 # detokenize current sentence 
                 response = self.llm.detokenize(self.response_sentence)
-                response = "".join(response)
 
                 # Sometimes the previous sentence was already the end of the sequence but the EOS
                 # token is generated after the end of sentence token. If the sequence ends but the current
@@ -690,16 +687,17 @@ class STT_LLM_TTS(torch.nn.Module):
                         
                         # Add format tokens 
                         # TODO calculate key value cache earlier and use it here to save inference time
-                        self.call_LLM(input="\nAI:", reason="format", tokenize=True)
-                        self.response_sequence.append(self.last_token)
-                        self.response_sentence.append(self.last_token)
+                        self.call_LLM(input="<|end|>\n<|assistant|>\n", reason="format", tokenize=True)
+                        last_token = self.last_token.item()
+                        self.response_sequence.append(last_token)
+                        self.response_sentence.append(last_token)
 
                 # LLM generates a new token and adds it to the response sequence
                 if self.generating:
-                    self.last_token = torch.unsqueeze(self.last_token, 0)
                     self.call_LLM(input=self.last_token, reason="generating", tokenize=False)
-                    self.response_sequence.append(self.last_token)
-                    self.response_sentence.append(self.last_token)
+                    last_token = self.last_token.item()
+                    self.response_sequence.append(last_token)
+                    self.response_sentence.append(last_token)
 
                     # check for stopping conditions
                     end, response, wav = self.handle_stop_conditions()
