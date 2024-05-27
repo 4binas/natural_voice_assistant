@@ -317,8 +317,6 @@ class LLM(torch.nn.Module):
                 next_token_logits[:, :, i] = -float("inf")
         
         # Select token with highes probability
-        # next_tokens = torch.argmax(next_token_logits, dim=-1)
-        # next_tokens = next_tokens * unfinished_sequences + torch.Tensor(self.pad_token_id * (1 - unfinished_sequences)).to(self.device)
         next_tokens = next_token_logits.argmax(dim=-1)
         return next_tokens, past_key_values
 
