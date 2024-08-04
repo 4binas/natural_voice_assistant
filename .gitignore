@@ -1,2 +1,5 @@
 __pycache__
 latencies/times*
+faiss.index
+faiss.index.docs
+documents/*
