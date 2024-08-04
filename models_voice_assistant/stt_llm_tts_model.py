@@ -2,12 +2,19 @@ import time
 import torch
 import numpy as np
 from copy import deepcopy
+
+from tqdm import tqdm
+from models_voice_assistant.RAG.document_loaders.pdf_chunk_loader import PDFChunkLoader
+from models_voice_assistant.RAG.encoder.gteLargeEn import GTELargeEncoder
+from models_voice_assistant.RAG.vector_store.FAISS import FAISSStore
 from utils_voice_assistant.nemo_loader import load_rnnt_model
 from models_voice_assistant.TTS.style_tts2_model import StyleTTS2Model
 from models_voice_assistant.TTS.whisper_speech_model import WhisperSpeechModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 import os
 import json
+import pytextrank
+import spacy
 
 VERBOSE = False
 
@@ -266,7 +273,7 @@ class LLM(torch.nn.Module):
 
         # Initialize given model. Weights are downloaded from HF hub and cached
         self.model = AutoModelForCausalLM.from_pretrained(model_name,low_cpu_mem_usage=True, torch_dtype="auto", trust_remote_code=True).to(self.device)
-        # self.model.eval()
+        self.model.eval()
 
         # Initialize tokenizer for given model. Weights are downloaded from HF hub and cached
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -352,7 +359,110 @@ class TTS(torch.nn.Module):
         """
          wav = self.tts_model(text)
          return wav 
- 
+
+class RAG():
+
+    def __init__(self, model_name: str, llm: LLM, device: str):
+        self.device = device
+        self.encoder = GTELargeEncoder(model_name=model_name, device=device)
+        self.vector_store = FAISSStore(embeddingModel=self.encoder)
+
+        self.llm = llm.model
+        self.tokenizer = llm.tokenizer
+
+        self.yes_token = self.tokenizer("yes", return_tensors="pt").input_ids.tolist()[0]
+        self.no_token = self.tokenizer("no", return_tensors="pt").input_ids.tolist()[0]
+        self.allowed_tokens = np.concatenate((self.yes_token, self.no_token))
+
+        if not os.path.exists("faiss.index") and not os.path.exists("faiss.index.docs"):
+            loader = PDFChunkLoader()
+            ducuments_path = "./documents"
+            documents = []
+            for file in tqdm(loader.get_pdf_files(ducuments_path)):
+                chunks = loader.load_pdf_split(f"{ducuments_path}/{file}", split_char="\n")
+                documents.extend(chunks)
+                self.vector_store.add_vectors(chunks)
+                self.vector_store.write_index("faiss.index")
+        else:
+            self.vector_store.read_index("faiss.index")
+
+        nlp = spacy.load("en_core_web_sm")
+        nlp.add_pipe("textrank")
+        doc = nlp(" ".join(self.vector_store.values[:100]))
+        self.topics = []
+        for phrase in doc._.phrases[:3]:
+           self.topics.append(phrase.text)
+
+        self.prompt_template = """<|user|>
+You are an expert in {topics} and are asked to answer the following question.
+Question:::
+{question}
+
+Is the question something you can answer, with your expertise?
+
+Only answer with yes or no. If i'ts not a question about {topics}, answer no.
+<|assistant|>"""
+
+        
+
+        
+
+    def _generate_answer(self, promt: str, past_key_values=None, max_tokens=250, allowed_tokens=None) -> list[int]:
+        generated_tokens = []
+        input_tokens = self.tokenizer(text=promt, return_tensors="pt").input_ids.to(self.device)
+        for token in input_tokens[0]:
+            # Generate logits and update past_key_values
+            t = torch.unsqueeze(torch.unsqueeze(token, 0),0)
+            model_inputs = self.llm.prepare_inputs_for_generation(t, past_key_values=past_key_values, use_cache=True, return_dict=True)
+            next_logits, past_key_values = self.llm(**model_inputs).to_tuple()
+
+            # Select the last token
+            next_token_id = t
+
+        for _ in range(max_tokens):
+            next_logits, past_key_values = self.llm(next_token_id, past_key_values=past_key_values, use_cache=True).to_tuple()
+
+            if allowed_tokens is not None:
+                logits = torch.zeros(next_logits.shape)
+                for i in allowed_tokens:
+                    logits[:, :, i] = next_logits[:, :, i]
+            else:
+                logits = next_logits
+
+            next_token_id = logits.argmax(dim=-1)
+
+            token = next_token_id.item()
+
+            if token in self.llm.generation_config.eos_token_id:
+                break
+
+            if token in self.tokenizer(text="<|user|>", return_tensors="pt").input_ids:
+                break
+
+            generated_tokens.append(next_token_id.item())
+
+        # text =  self.tokenizer.decode(generated_tokens)
+        return generated_tokens
+    
+    def _needs_rag(self, question: str, topics: list[str]):
+        prompt = self.prompt_template.format(question=question, topics=" ".join(topics))
+        generated_tokens = self._generate_answer(prompt, allowed_tokens=self.allowed_tokens, max_tokens=1)
+        if generated_tokens == self.yes_token:
+            return True
+        return False
+
+    def answer(self, question: str):
+        docs = self.vector_store.search(question)
+        return docs
+
+    # def forward(self, text: str):
+    #     rag_needed = self._needs_rag(text, "switzerland") # TODO: customize topics
+    #     if rag_needed:
+    #         return self.encoder.encode(text=text)
+    #     pass
+        
+        
+
 class STT_LLM_TTS(torch.nn.Module):
     
     THRESHOLD_VOICE_DETECTION  = -30000
@@ -369,10 +479,13 @@ class STT_LLM_TTS(torch.nn.Module):
         self.stt = STT(vocabulary_path="vocab.npy")
         
         # Init LLM model 
-        self.llm = LLM(model_name="microsoft/Phi-3-mini-4k-instruct", device=device)
+        self.llm = LLM(model_name="microsoft/Phi-3-mini-128k-instruct", device=device)
 
         # Init TTS model
         self.tts = TTS(device=device, tts_model=tts_model)
+
+        # Init RAG model
+        self.rag = RAG(model_name="Alibaba-NLP/gte-large-en-v1.5", llm=self.llm, device=device)
 
         # Init voice assistant state
         self.transcribed_tokens = []
@@ -390,6 +503,8 @@ class STT_LLM_TTS(torch.nn.Module):
         self.transcribing = True 
         self.last_return = None
         self.no_speech_count = 0
+        self.user_input = ""
+        self.rag_input = ""
 
         # Tracking latencies
         self.INIT_TIME = time.time()
@@ -483,6 +598,7 @@ class STT_LLM_TTS(torch.nn.Module):
         if len(transcribed_text)>0:
             # reset timer for last recognized word / subword
             self.last_token_timestep = time.time()
+            self.user_input += transcribed_text
             print(transcribed_text)
 
         # First STT run is very slow, show Start prompt afterwards and add format tokens to LLM
@@ -543,9 +659,45 @@ class STT_LLM_TTS(torch.nn.Module):
         wav = None
         response = None
 
+        if end_of_sentence or end_of_sequence or len(self.response_sentence)>=50:
+            if self.user_input != "":
+                input = self.user_input
+                self.user_input = ""
+                start = time.time()
+                rag = self.rag._needs_rag(input.strip(), topics=", ".join(self.rag.topics))
+                print("## RAG Evaluation Latency: ", round(time.time()-start,3), " | Result: ", rag)
+                if rag:
+                    docs = self.rag.vector_store.search(input.strip(), 3)
+                    response = "Let me think about it"
+                    self.rag_input = """<|system|>
+Using the information contained in the context, give a comprehensive answer to the question below.
+Respond only to the question asked, the response should be concise and relevant to the question.
+Only answer the question.
+
+Context:
+{context}
+---
+Now here is the question you need to answer.
+<|user|>
+{question}
+<|assistant|>
+""".format(context="\n".join(docs), question=input.strip())
+                    wav = self.tts(response)
+                    end = True
+                    self.current_word = ""
+                    self.transcribing = False
+                    # reset sentence and sequenc 
+                    self.response_sequence = []
+                    self.response_sentence = []
+                    self.start_generation_timestep = None
+                    print()
+                    return end, response, wav
+            
+
+
         if end_of_sentence or len(self.response_sentence)>=50:
             # --> End of Sentence
-            if time.time() - self.last_token_timestep > 0.3:
+            if self.last_token_timestep is not None and time.time() - self.last_token_timestep > 0.3:
                 end = True
                 response = self.llm.detokenize(self.response_sentence)
 
@@ -659,6 +811,24 @@ class STT_LLM_TTS(torch.nn.Module):
                         self.start_generation_timestep = None
                         self.times_interrupt.append({"start":time.time()-self.INIT_TIME})
                         return None, None, True
+                
+                if self.rag_input != "":
+                    self.generating = True
+                    # backup key-value chache to restore it in case on an interrupt
+                    self.past_key_values = deepcopy(self.past_key_values_backup)
+                    self.start_generation_timestep = time.time()
+                    self.times_start.append({"start":self.start_generation_timestep-self.INIT_TIME})
+                    if VERBOSE:
+                        print("\n\n[START] ", round(time.time()-self.last_token_timestep,3))
+
+                    
+                    # Add format tokens 
+                    # TODO calculate key value cache earlier and use it here to save inference time
+                    self.call_LLM(input=self.rag_input, reason="rag", tokenize=True)
+                    self.rag_input = ""
+                    last_token = self.last_token.item()
+                    self.response_sequence.append(last_token)
+                    self.response_sentence.append(last_token)
                 
                 # Handle token generation when no new word was detected
                 if self.last_token_timestep is not None and not self.first and len(transcribed_text)==0:
